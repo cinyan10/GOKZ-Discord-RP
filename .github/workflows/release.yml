@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'   # e.g. v0.1.0
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'   # match your target framework
+
+      - name: Publish single-file (self-contained)
+        run: |
+          dotnet publish "src/CS2-Discord-RP.csproj" `
+            -c Release -r win-x64 -o .\dist `
+            -p:PublishSingleFile=true `
+            -p:SelfContained=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -p:EnableCompressionInSingleFile=true
+
+      - name: Include GSI config
+        run: Copy-Item .\src\Assets\gamestate_integration_discord-rp.cfg .\dist\
+
+      - name: Rename exe (optional, cleaner name)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path .\dist\*.exe | Select-Object -First 1
+          Rename-Item $exe.FullName GOKZ-Discord-RP.exe
+
+      - name: Zip artifacts
+        shell: pwsh
+        run: Compress-Archive -Path .\dist\* -DestinationPath .\GOKZ-Discord-RP-win-x64.zip -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            GOKZ-Discord-RP-win-x64.zip
+            dist/GOKZ-Discord-RP.exe
+            dist/gamestate_integration_discord-rp.cfg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
