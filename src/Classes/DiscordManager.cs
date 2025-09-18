@@ -1,4 +1,10 @@
-﻿using DiscordRPC;
+﻿using System;
+using System.Linq;
+using System.Net.Http;
+using System.Collections.Generic;
+using System.Diagnostics;              // Process monitor
+using Newtonsoft.Json.Linq;
+using DiscordRPC;
 using DiscordRPC.Logging;
 using GameState;
 
@@ -8,16 +14,25 @@ public class DiscordManager
 {
 	public static DiscordRpcClient Client;
 
+	// Elapsed timer start (set once when first valid GSI payload is seen)
+	private static DateTime? _gameStartUtc = null;
+
+	// HTTP client + cache for map difficulties
+	private static readonly HttpClient _http = new HttpClient();
+	private static readonly Dictionary<string, string> _difficultyCache = new();
+
+	// Process watchdog (polls for csgo.exe)
+	private static System.Timers.Timer _procWatchdogTimer;
+	private static bool _csgoRunningLast = false;
+
 	public static void Initialize()
 	{
-		// Create our Discord client. This is the ID of the application I have created which
-		// contains all image assets and icons. There is no reason to replace it.
-		Client = new DiscordRpcClient( "872181511334543370", autoEvents: false )
+		// Your Discord Application (Client) ID
+		Client = new DiscordRpcClient( "1400566342687522976", autoEvents: false )
 		{
 			Logger = new ConsoleLogger() { Level = LogLevel.Warning }
 		};
 
-		// Subscribe to events.
 		Client.OnReady += ( sender, args ) =>
 		{
 			Console.WriteLine( "[DISCORD] Received 'ready' from user {0}", args.User.Username );
@@ -28,126 +43,158 @@ public class DiscordManager
 			Console.WriteLine( "[DISCORD] Presence updated!" );
 		};
 
-		// Connect to the RPC.
 		Client.Initialize();
+
+		// Start a lightweight watchdog that checks csgo.exe every 3s
+		_procWatchdogTimer = new System.Timers.Timer( 3000 );
+		_procWatchdogTimer.Elapsed += ( s, e ) => CheckCsgoProcess();
+		_procWatchdogTimer.AutoReset = true;
+		_procWatchdogTimer.Start();
+	}
+
+	private static void CheckCsgoProcess()
+	{
+		bool runningNow = IsProcessRunning( "csgo" ); // Only CS:GO (not CS2)
+
+		// Transition: running -> not running  ==> clear presence immediately
+		if ( _csgoRunningLast && !runningNow )
+		{
+			try
+			{
+				Client?.ClearPresence();
+				_gameStartUtc = null; // reset session start; next launch starts fresh
+				Console.WriteLine( "[DISCORD] csgo.exe not found. Presence cleared." );
+			}
+			catch { /* ignore */ }
+		}
+
+		_csgoRunningLast = runningNow;
+	}
+
+	private static bool IsProcessRunning( string processNameNoExe )
+	{
+		try
+		{
+			// Match by name (without .exe). If multiple, any means "running".
+			return Process.GetProcessesByName( processNameNoExe ).Length > 0;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private static string GetMapDifficulty( string mapName )
+	{
+		if ( _difficultyCache.TryGetValue( mapName, out var cached ) )
+			return cached;
+
+		try
+		{
+			string url = $"https://kztimerglobal.com/api/v2.0/maps/name/{mapName}";
+			string json = _http.GetStringAsync( url ).GetAwaiter().GetResult();
+			var obj = JObject.Parse( json );
+
+			int diff = obj["difficulty"]?.Value<int>() ?? 0;
+			string tier = diff > 0 ? $"T{diff}" : "T?";
+			_difficultyCache[mapName] = tier;
+			return tier;
+		}
+		catch ( Exception ex )
+		{
+			Console.WriteLine( $"[DISCORD] Failed to fetch difficulty for {mapName}: {ex.Message}" );
+			return "T?";
+		}
 	}
 
 	public static RichPresence BuildPresenceFromData( TopLevel gameData )
 	{
-		// Default presence will be set to menu.
-		RichPresence presence = new()
+		// Default presence = menu
+		var presence = new RichPresence
 		{
 			Details = "Main Menu",
 			State = "In Menu",
-			Assets = new Assets()
+			Assets = new Assets
 			{
 				LargeImageKey = "menu",
 				LargeImageText = "Menu",
-			}
+			},
+			Timestamps = _gameStartUtc.HasValue ? new Timestamps { Start = _gameStartUtc.Value } : null
 		};
 
-		// If for whatever reason we have bad data OR one of our core JSON categories are null, return early.
-		// For example, gameData.Player is null while loading into a game/map. We need to handle that properly.
-		if ( gameData == null || gameData.Provider == null || gameData.Map == null || gameData.Player == null ) return presence;
+		// Guard against partial payloads
+		if ( gameData == null || gameData.Provider == null || gameData.Map == null || gameData.Player == null )
+			return presence;
 
-		// Let's start building our rich presence.
-		// First check if we are really playing.
+		// First valid payload → mark session start once
+		if ( _gameStartUtc == null )
+			_gameStartUtc = DateTime.UtcNow;
+
 		if ( gameData.Player.Activity == "playing" )
 		{
-			// Regardless of the gamemode we play, we will have the large image set to the map.
-			presence = new RichPresence()
+			// timer = kills (seconds)
+			long killsSeconds = gameData.Player.MatchStats?.Kills ?? 0;
+			var ts = TimeSpan.FromSeconds( killsSeconds );
+			string timerText = ts.TotalHours >= 1
+				? ts.ToString( @"h\:mm\:ss" )
+				: ts.ToString( @"mm\:ss" );
+
+			// tp = deaths
+			long tp = gameData.Player.MatchStats?.Deaths ?? 0;
+
+			// progress = score / 10 with one decimal
+			double progress = (gameData.Player.MatchStats?.Score ?? 0) / 10.0;
+			string progressText = $"{progress:0.0}%";
+
+			// KZ mode from clan tag like "[KZT Semipro]" → "KZT"
+			string kzMode = "KZT";
+			string clan = gameData.Player.Clan;
+			if ( !string.IsNullOrWhiteSpace( clan ) )
 			{
-				Assets = new Assets()
+				int li = clan.IndexOf( '[' );
+				int ri = (li >= 0) ? clan.IndexOf( ']', li + 1 ) : -1;
+				if ( li >= 0 && ri > li )
 				{
-					LargeImageKey = gameData.Map.Name,
-					LargeImageText = $"Playing on {gameData.Map.Name}",
-				},
-			};
-
-			string FixedModeName = null;
-
-			// Let's create different presences for each gamemode.
-			switch ( gameData.Map.Mode )
-			{
-				// Casual, competitive and wingman.
-				case "casual":
-				case "competitive":
-				case "scrimcomp2v2":
-
-					if ( gameData.Map.Mode == "scrimcomp2v2" ) FixedModeName = "Wingman";
-
-					presence.Details = $"{Utils.FirstCharToUpper( gameData.Player.Activity )} {FixedModeName ?? Utils.FirstCharToUpper( gameData.Map.Mode )}";
-					presence.State = $"{Utils.FirstCharToUpper( gameData.Map.Phase )} - CT: {gameData.Map.TeamCt.Score} | {gameData.Map.TeamT.Score} :T";
-
-					// We are not spectating someone else, we have fully connected to the server and we are on a team.
-					if ( gameData.Provider.Steamid == gameData.Player.Steamid && gameData.Player.Name != "unconnected" && gameData.Player.State.Health > 0 )
-					{
-						presence.Assets.SmallImageKey = $"{gameData.Player.Team.ToLower()}_logo";
-						presence.Assets.SmallImageText = $"Playing as {gameData.Player.Team}";
-					}
-					// We are spectating/observing.
-					else
-					{
-						presence.Details = $"Watching {FixedModeName ?? Utils.FirstCharToUpper( gameData.Map.Mode )}";
-						presence.Assets.SmallImageKey = gameData.Map.Mode;
-						presence.Assets.SmallImageText = "Spectating/Observing";
-					}
-					break;
-
-				// Arms race, demolition and deathmatch.
-				case "gungameprogressive":
-				case "gungametrbomb":
-				case "deathmatch":
-					if ( gameData.Map.Mode == "gungameprogressive" ) FixedModeName = "Armsrace";
-					if ( gameData.Map.Mode == "gungametrbomb" ) FixedModeName = "Demolition";
-
-					presence.Details = $"{Utils.FirstCharToUpper( gameData.Player.Activity )} {FixedModeName ?? Utils.FirstCharToUpper( gameData.Map.Mode )}";
-					presence.State = $"{Utils.FirstCharToUpper( gameData.Map.Phase )} - Kills: {gameData.Player.MatchStats.Kills}";
-
-					presence.Assets.SmallImageKey = gameData.Map.Mode;
-					presence.Assets.SmallImageText = FixedModeName ?? Utils.FirstCharToUpper( gameData.Map.Mode );
-					break;
-
-				// Training.
-				case "training":
-					presence.Details = "Training";
-					break;
-
-				// Guardian and Co-Op missions.
-				case "cooperative":
-				case "coopmission":
-					if ( gameData.Map.Mode == "cooperative" ) FixedModeName = "Guardian";
-					if ( gameData.Map.Mode == "coopmission" ) FixedModeName = "Co-Op Strike";
-
-					presence.Details = $"{Utils.FirstCharToUpper( gameData.Player.Activity )} {FixedModeName ?? Utils.FirstCharToUpper( gameData.Map.Mode )}";
-					presence.State = $"Defending the objective - Kills: {gameData.Player.MatchStats.Kills}";
-
-					presence.Assets.SmallImageKey = gameData.Map.Mode;
-					presence.Assets.SmallImageText = FixedModeName;
-					break;
-
-				// Danger zone.
-				case "survival":
-					if ( gameData.Map.Mode == "survival" ) FixedModeName = "Danger Zone";
-
-					presence.Details = $"{Utils.FirstCharToUpper( gameData.Player.Activity )} {FixedModeName ?? Utils.FirstCharToUpper( gameData.Map.Mode )}";
-
-					if ( gameData.Player.State.Health > 0 )
-						presence.State = $"Status: Alive - Kills: {gameData.Player.MatchStats.Kills}";
-					else presence.State = $"Status: Dead - Kills: {gameData.Player.MatchStats.Kills}";
-
-					presence.Assets.SmallImageKey = gameData.Map.Mode;
-					presence.Assets.SmallImageText = FixedModeName;
-					break;
-
-				// Any other mode that we cannot recognize will have some default images.
-				default:
-					presence.Details = "Custom Gamemode";
-					presence.State = "No Data";
-					presence.Assets.SmallImageKey = "default";
-					break;
+					var inside = clan.Substring( li + 1, ri - li - 1 );
+					var firstToken = inside.Split( ' ', StringSplitOptions.RemoveEmptyEntries ).FirstOrDefault();
+					if ( !string.IsNullOrWhiteSpace( firstToken ) )
+						kzMode = firstToken.ToUpperInvariant();
+				}
 			}
+
+			// Fetch difficulty tier from KZTimerGlobal API (cached)
+			string tier = GetMapDifficulty( gameData.Map.Name );
+
+			presence = new RichPresence
+			{
+				Details = $"Playing {gameData.Map.Name} {tier}",               // First line
+				State = $"[{kzMode}] {timerText} | TP: {tp} | {progressText}", // Second line
+				Assets = new Assets
+				{
+					// If you hit the 300-asset cap, swap to a static KZ logo key here.
+					LargeImageKey = gameData.Map.Name,
+					LargeImageText = $"Playing on {gameData.Map.Name}"
+				},
+				// Keep same start so green elapsed timer doesn't reset
+				Timestamps = new Timestamps { Start = _gameStartUtc.Value }
+			};
 		}
+		else
+		{
+			// In menu — keep same timestamp so elapsed shows from game start
+			presence = new RichPresence
+			{
+				Details = "Main Menu",
+				State = "In Menu",
+				Assets = new Assets
+				{
+					LargeImageKey = "menu",
+					LargeImageText = "Main Menu"
+				},
+				Timestamps = new Timestamps { Start = _gameStartUtc.Value }
+			};
+		}
+
 		return presence;
 	}
 }

@@ -18,6 +18,10 @@ public partial class TopLevel
 
 	[JsonProperty( "player" )]
 	public Player Player { get; set; }
+
+	// Optional: present in your sample
+	[JsonProperty( "previously", NullValueHandling = NullValueHandling.Ignore )]
+	public Previously Previously { get; set; }
 }
 
 public partial class Map
@@ -69,6 +73,10 @@ public partial class Player
 {
 	[JsonProperty( "steamid" )]
 	public string Steamid { get; set; }
+
+	// NEW: read the clan tag (e.g., "[KZT Semipro]")
+	[JsonProperty( "clan", NullValueHandling = NullValueHandling.Ignore )]
+	public string Clan { get; set; }
 
 	[JsonProperty( "name" )]
 	public string Name { get; set; }
@@ -161,6 +169,37 @@ public partial class Provider
 	public long Timestamp { get; set; }
 }
 
+// NEW: optional "previously" block (as in your sample)
+public partial class Previously
+{
+	[JsonProperty( "player", NullValueHandling = NullValueHandling.Ignore )]
+	public PreviouslyPlayer Player { get; set; }
+}
+
+public partial class PreviouslyPlayer
+{
+	[JsonProperty( "match_stats", NullValueHandling = NullValueHandling.Ignore )]
+	public PreviouslyMatchStats MatchStats { get; set; }
+}
+
+public partial class PreviouslyMatchStats
+{
+	[JsonProperty( "kills", NullValueHandling = NullValueHandling.Ignore )]
+	public long? Kills { get; set; }
+
+	[JsonProperty( "assists", NullValueHandling = NullValueHandling.Ignore )]
+	public long? Assists { get; set; }
+
+	[JsonProperty( "deaths", NullValueHandling = NullValueHandling.Ignore )]
+	public long? Deaths { get; set; }
+
+	[JsonProperty( "mvps", NullValueHandling = NullValueHandling.Ignore )]
+	public long? Mvps { get; set; }
+
+	[JsonProperty( "score", NullValueHandling = NullValueHandling.Ignore )]
+	public long? Score { get; set; }
+}
+
 public partial class TopLevel
 {
 	public static TopLevel FromJson( string json ) => JsonConvert.DeserializeObject<TopLevel>( json, Converter.Settings );
@@ -178,8 +217,8 @@ internal static class Converter
 		MetadataPropertyHandling = MetadataPropertyHandling.Ignore,
 		DateParseHandling = DateParseHandling.None,
 		Converters =
-			{
-				new IsoDateTimeConverter { DateTimeStyles = DateTimeStyles.AssumeUniversal }
-			},
+		{
+			new IsoDateTimeConverter { DateTimeStyles = DateTimeStyles.AssumeUniversal }
+		},
 	};
 }
